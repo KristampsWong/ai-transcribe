@@ -10,15 +10,7 @@ type Segment = {
   error?: string;
 };
 
-type SpeechRecognitionExtended = SpeechRecognition & {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
-  onend: (() => void) | null;
-  onresult: ((event: SpeechRecognitionEvent) => void) | null;
-  onstart: (() => void) | null;
-};
+type SpeechRecognitionExtended = SpeechRecognition;
 
 export default function Home() {
   const [isSupported, setIsSupported] = useState(false);
@@ -42,8 +34,15 @@ export default function Home() {
   useEffect(() => {
     if (typeof window === "undefined") return;
 
+    type SpeechRecognitionConstructor = new () => SpeechRecognition;
+
+    const globalWindow = window as typeof window & {
+      SpeechRecognition?: SpeechRecognitionConstructor;
+      webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    };
+
     const SpeechRecognitionConstructor =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      globalWindow.SpeechRecognition ?? globalWindow.webkitSpeechRecognition;
 
     if (!SpeechRecognitionConstructor) {
       setIsSupported(false);
@@ -120,7 +119,7 @@ export default function Home() {
       if (shouldResumeRef.current) {
         try {
           recognition.start();
-        } catch (err) {
+        } catch {
           setError("语音识别重启失败，请手动重新开始。");
           setIsListening(false);
         }
@@ -240,7 +239,7 @@ export default function Home() {
         periodicRestartRef.current = null;
       }
     };
-  }, [isListening]);
+  }, [isListening, PERIODIC_RESTART_MS]);
 
   useEffect(() => {
     scrollAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });

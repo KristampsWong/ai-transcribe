@@ -12,9 +12,10 @@ import { useSpeechFlow } from "./hooks/useSpeechFlow";
 
 const scrollToBottom = (node: HTMLDivElement | null) => {
   if (!node) return;
-  const scroll = () => node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-  requestAnimationFrame(scroll);
-  setTimeout(scroll, 0);
+  // 内容以流式高频更新，smooth 动画会被每次更新打断而永远滚不到底，必须用即时滚动。
+  requestAnimationFrame(() => {
+    node.scrollTop = node.scrollHeight;
+  });
 };
 
 // 与 useSpeechFlow 中的默认值保持一致，仅用于 UI 层判断是否已自定义 prompt。
@@ -133,12 +134,12 @@ export default function Home() {
           </div>
         ) : null}
 
-        <div className="flex flex-col gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <section className="space-y-4">
             <h2 className="text-lg font-semibold text-slate-200">实时转写 & 翻译</h2>
             <div
               ref={translationListRef}
-              className="space-y-4 max-h-[60vh] overflow-y-auto pr-2 no-scrollbar"
+              className="space-y-4 max-h-[600px] overflow-y-auto pr-2 no-scrollbar"
             >
               {segments.length === 0 && !interimTranscript ? (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-500">
@@ -153,8 +154,6 @@ export default function Home() {
               {interimTranscript ? (
                 <InterimTranslationCard
                   interimTranscript={interimTranscript}
-                  interimTranslation={interimTranslation}
-                  isTranslatingInterim={isTranslatingInterim}
                   interimIsQuestion={interimIsQuestion}
                 />
               ) : null}
@@ -165,7 +164,7 @@ export default function Home() {
             <h2 className="text-lg font-semibold text-slate-200">AI 问答</h2>
             <div
               ref={qaListRef}
-              className="space-y-4 max-h-[40vh] overflow-y-auto pr-2 no-scrollbar"
+              className="space-y-4 max-h-[600px] overflow-y-auto pr-2 no-scrollbar"
             >
               {segments.length === 0 && !interimTranscript ? (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-500">

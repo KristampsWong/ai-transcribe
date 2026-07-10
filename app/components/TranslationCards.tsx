@@ -35,15 +35,11 @@ export function TranslationSegmentCard({ segment }: TranslationSegmentCardProps)
 
 type InterimTranslationCardProps = {
   interimTranscript: string;
-  interimTranslation: string;
-  isTranslatingInterim: boolean;
   interimIsQuestion: boolean;
 };
 
 export function InterimTranslationCard({
   interimTranscript,
-  interimTranslation,
-  isTranslatingInterim,
   interimIsQuestion,
 }: InterimTranslationCardProps) {
   return (
@@ -56,16 +52,6 @@ export function InterimTranslationCard({
     >
       <p className="font-medium">识别中（临时结果）</p>
       <p className="mt-1 whitespace-pre-wrap">{interimTranscript}</p>
-      <div className="mt-3 rounded border border-emerald-500/30 bg-emerald-500/5 p-3 text-slate-100">
-        <p className="text-xs font-medium text-emerald-200">实时翻译</p>
-        {isTranslatingInterim ? (
-          <p className="mt-1 text-xs text-emerald-100/80">GPT 翻译中…</p>
-        ) : (
-          <p className="mt-1 text-sm text-slate-100 whitespace-pre-wrap">
-            {interimTranslation || "等待更多语音…"}
-          </p>
-        )}
-      </div>
     </div>
   );
 }

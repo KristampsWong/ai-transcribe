@@ -466,8 +466,9 @@ export function useRealtimeTranscription(
     try {
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
-      // 转写会话没有下行音频，用 sendonly 单向 transceiver 语义更明确（同时仍挂上本地音轨）。
-      pc.addTransceiver(stream.getTracks()[0], { direction: "sendonly" });
+      // 用 addTrack 挂载本地音轨（sendonly transceiver 实测会导致 OpenAI 收不到音频，
+      // commit 时报 buffer 0.00ms —— 保持与官方示例一致的 addTrack）。
+      pc.addTrack(stream.getTracks()[0]);
 
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;

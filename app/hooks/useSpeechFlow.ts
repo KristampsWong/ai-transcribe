@@ -4,342 +4,92 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Segment } from "@/types/segment";
 
-type SpeechRecognitionExtended = SpeechRecognition;
-type Timer = ReturnType<typeof setTimeout>;
+import { useRealtimeTranscription } from "./useRealtimeTranscription";
 
-const INTERIM_DEBOUNCE_MS = 600;
-const PERIODIC_RESTART_MS = 5 * 60 * 1000;
+const MAX_SEGMENTS = 200;
+
+type HistoryEntry = {
+  id: string;
+  english: string;
+  chinese: string;
+};
+
+type AnswerResponsePayload = {
+  isQuestion?: boolean;
+  answer?: { english: string; chinese: string } | null;
+  error?: string;
+};
 
 export function useSpeechFlow() {
-  const [isSupported, setIsSupported] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [interimTranscript, setInterimTranscript] = useState("");
-  const [interimTranslation, setInterimTranslation] = useState("");
-  const [isTranslatingInterim, setIsTranslatingInterim] = useState(false);
-  const [interimAnswer, setInterimAnswer] = useState<{
-    english: string;
-    chinese: string;
-  } | null>(null);
-  const [isAnsweringInterim, setIsAnsweringInterim] = useState(false);
-  const [interimIsQuestion, setInterimIsQuestion] = useState(false);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [customPrompt, setCustomPrompt] = useState(
     "You are a helpful AI assistant in a real-time meeting context. Answer questions concisely and naturally. Provide your answer in both English and Chinese (Simplified), separated by '---SEPARATOR---'. Format: English answer first, then the separator, then Chinese answer."
   );
 
-  const recognitionRef = useRef<SpeechRecognitionExtended | null>(null);
-  const shouldResumeRef = useRef(false);
-  const interimTranslateAbortRef = useRef<AbortController | null>(null);
-  const interimAnswerAbortRef = useRef<AbortController | null>(null);
-  const interimTranslateTimerRef = useRef<Timer | null>(null);
-  const interimAnswerTimerRef = useRef<Timer | null>(null);
-  const lastInterimTextRef = useRef("");
-  const periodicRestartRef = useRef<Timer | null>(null);
-  const enqueueSegmentRef = useRef<((english: string) => void) | null>(null);
+  // 本地“监听意图”标记：在 isListening 真正翻转前拦截重复点击，避免 start/stop 交错。
+  const listenIntentRef = useRef(false);
 
+  // final 链路里的异步回填读取最新 customPrompt，避免把它塞进 onFinalSegment 的依赖数组。
+  const customPromptRef = useRef(customPrompt);
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    customPromptRef.current = customPrompt;
+  }, [customPrompt]);
 
-    type SpeechRecognitionConstructor = new () => SpeechRecognition;
+  // 同步维护的历史记录：onFinalSegment 内同步 push，不依赖 setSegments 的异步生效时机。
+  // 传给 /api/answer 的 history 从这里 slice(-5)（在 push 当前轮之前取，天然不含当前句）。
+  const historyRef = useRef<HistoryEntry[]>([]);
 
-    const globalWindow = window as typeof window & {
-      SpeechRecognition?: SpeechRecognitionConstructor;
-      webkitSpeechRecognition?: SpeechRecognitionConstructor;
-    };
+  // F4：与 segments 状态同节奏裁剪的 id 列表（同步维护，不依赖 setSegments 的异步生效时机）。
+  // 用于在裁掉最旧 segment 时，识别被裁掉的 id 并 abort 其在途请求，避免网络卡住时 controller 泄漏。
+  const segmentIdsRef = useRef<string[]>([]);
 
-    const SpeechRecognitionConstructor =
-      globalWindow.SpeechRecognition ?? globalWindow.webkitSpeechRecognition;
+  // 每个 segment 的在途 translate/answer 请求的 AbortController；handleClear/卸载时统一 abort 并清空，
+  // 回填前逐一检查 controller.signal.aborted，防止陈旧请求在 segment 被裁剪/清空后仍写回状态。
+  const abortMapRef = useRef<Map<string, AbortController[]>>(new Map());
 
-    if (!SpeechRecognitionConstructor) {
-      setIsSupported(false);
-      return;
+  const addAbortController = useCallback((id: string, controller: AbortController) => {
+    const list = abortMapRef.current.get(id);
+    if (list) {
+      list.push(controller);
+    } else {
+      abortMapRef.current.set(id, [controller]);
     }
-
-    setIsSupported(true);
-
-    const recognition: SpeechRecognitionExtended = new SpeechRecognitionConstructor();
-    recognition.lang = "en-US";
-    recognition.continuous = true;
-    recognition.interimResults = true;
-
-    recognition.onstart = () => {
-      setIsListening(true);
-      setError(null);
-    };
-
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let interim = "";
-      const finalSegments: string[] = [];
-
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const result = event.results[i];
-        const transcript = result[0].transcript;
-        if (result.isFinal) {
-          finalSegments.push(transcript);
-        } else {
-          interim += transcript;
-        }
-      }
-
-      if (finalSegments.length > 0) {
-        finalSegments.forEach((text) => {
-          const cleaned = text.trim();
-          if (!cleaned) return;
-          enqueueSegmentRef.current?.(cleaned);
-        });
-        setInterimTranscript("");
-        setInterimTranslation("");
-        setIsTranslatingInterim(false);
-        setInterimAnswer(null);
-        setIsAnsweringInterim(false);
-        setInterimIsQuestion(false);
-        lastInterimTextRef.current = "";
-      } else {
-        setInterimTranscript(interim.trim());
-      }
-    };
-
-    recognition.onerror = (event) => {
-      const { error: errorType } = event;
-      if (errorType === "aborted") return;
-
-      const message =
-        errorType === "not-allowed"
-          ? "浏览器阻止了麦克风访问，请允许权限后重新启动。"
-          : errorType === "no-speech"
-            ? "未检测到语音输入，稍后请再试。"
-            : "语音识别出现异常，请稍后再试。";
-      setError(message);
-      shouldResumeRef.current = false;
-      recognition.stop();
-    };
-
-    recognition.onend = () => {
-      if (shouldResumeRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          setError("语音识别重启失败，请手动重新开始。");
-          setIsListening(false);
-        }
-      } else {
-        setIsListening(false);
-      }
-    };
-
-    recognitionRef.current = recognition;
-
-    return () => {
-      shouldResumeRef.current = false;
-      recognition.stop();
-      recognitionRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (!interimTranscript) {
-      if (interimTranslateTimerRef.current) {
-        clearTimeout(interimTranslateTimerRef.current);
-        interimTranslateTimerRef.current = null;
+  const removeAbortController = useCallback((id: string, controller: AbortController) => {
+    const list = abortMapRef.current.get(id);
+    if (!list) return;
+    const idx = list.indexOf(controller);
+    if (idx !== -1) list.splice(idx, 1);
+    if (list.length === 0) abortMapRef.current.delete(id);
+  }, []);
+
+  const abortAllPending = useCallback(() => {
+    for (const controllers of abortMapRef.current.values()) {
+      for (const controller of controllers) {
+        controller.abort();
       }
-      if (interimTranslateAbortRef.current) {
-        interimTranslateAbortRef.current.abort();
-        interimTranslateAbortRef.current = null;
-      }
-      setInterimTranslation("");
-      setIsTranslatingInterim(false);
-      return;
     }
+    abortMapRef.current.clear();
+  }, []);
 
-    if (interimTranscript === lastInterimTextRef.current) return;
+  const updateHistoryChinese = useCallback((id: string, chinese: string) => {
+    const entry = historyRef.current.find((item) => item.id === id);
+    if (entry) entry.chinese = chinese;
+  }, []);
 
-    if (interimTranslateTimerRef.current) {
-      clearTimeout(interimTranslateTimerRef.current);
-    }
-
-    interimTranslateTimerRef.current = setTimeout(() => {
-      if (interimTranslateAbortRef.current) {
-        interimTranslateAbortRef.current.abort();
-      }
-
+  // 兜底翻译：仅在底层未能在超时内给出中文输出流时调用（chinese === ""）。
+  const fetchTranslateFallback = useCallback(
+    (id: string, english: string) => {
       const controller = new AbortController();
-      interimTranslateAbortRef.current = controller;
-      lastInterimTextRef.current = interimTranscript;
-      setIsTranslatingInterim(true);
+      addAbortController(id, controller);
 
-      fetch("/api/translate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: interimTranscript }),
-        signal: controller.signal,
-      })
-        .then(async (res) => {
-          const payload = await res.json();
-          if (!res.ok) {
-            throw new Error(payload.error || "翻译失败，请稍后重试。");
-          }
-          if (controller.signal.aborted) return;
-          setInterimTranslation(
-            typeof payload.translation === "string" ? payload.translation : ""
-          );
-          setIsTranslatingInterim(false);
-        })
-        .catch((err) => {
-          if (err.name === "AbortError") return;
-          setIsTranslatingInterim(false);
-        });
-    }, INTERIM_DEBOUNCE_MS);
-
-    return () => {
-      if (interimTranslateTimerRef.current) {
-        clearTimeout(interimTranslateTimerRef.current);
-        interimTranslateTimerRef.current = null;
-      }
-    };
-  }, [interimTranscript]);
-
-  useEffect(() => {
-    if (!interimTranscript) {
-      if (interimAnswerTimerRef.current) {
-        clearTimeout(interimAnswerTimerRef.current);
-        interimAnswerTimerRef.current = null;
-      }
-      if (interimAnswerAbortRef.current) {
-        interimAnswerAbortRef.current.abort();
-        interimAnswerAbortRef.current = null;
-      }
-      setInterimAnswer(null);
-      setIsAnsweringInterim(false);
-      setInterimIsQuestion(false);
-      return;
-    }
-
-    if (interimAnswerTimerRef.current) {
-      clearTimeout(interimAnswerTimerRef.current);
-    }
-
-    interimAnswerTimerRef.current = setTimeout(() => {
-      if (interimAnswerAbortRef.current) {
-        interimAnswerAbortRef.current.abort();
-      }
-
-      const controller = new AbortController();
-      interimAnswerAbortRef.current = controller;
-      setIsAnsweringInterim(true);
-
-      const history = segments.map((seg) => ({
-        english: seg.english,
-        chinese: seg.chinese,
-      }));
-
-      fetch("/api/answer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: interimTranscript, history, customPrompt }),
-        signal: controller.signal,
-      })
-        .then(async (res) => {
-          const payload = await res.json();
-          if (!res.ok) {
-            throw new Error(payload.error || "AI回答失败。");
-          }
-          if (controller.signal.aborted) return;
-
-          setInterimIsQuestion(payload.isQuestion || false);
-          if (payload.isQuestion && payload.answer) {
-            setInterimAnswer({
-              english: payload.answer.english || "",
-              chinese: payload.answer.chinese || "",
-            });
-          } else {
-            setInterimAnswer(null);
-          }
-          setIsAnsweringInterim(false);
-        })
-        .catch((err) => {
-          if (err.name === "AbortError") return;
-          setIsAnsweringInterim(false);
-        });
-    }, INTERIM_DEBOUNCE_MS);
-
-    return () => {
-      if (interimAnswerTimerRef.current) {
-        clearTimeout(interimAnswerTimerRef.current);
-        interimAnswerTimerRef.current = null;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [interimTranscript, segments]);
-
-  useEffect(
-    () => () => {
-      if (interimTranslateTimerRef.current) {
-        clearTimeout(interimTranslateTimerRef.current);
-      }
-      if (interimAnswerTimerRef.current) {
-        clearTimeout(interimAnswerTimerRef.current);
-      }
-      if (interimTranslateAbortRef.current) {
-        interimTranslateAbortRef.current.abort();
-      }
-      if (interimAnswerAbortRef.current) {
-        interimAnswerAbortRef.current.abort();
-      }
-      if (periodicRestartRef.current) {
-        clearInterval(periodicRestartRef.current);
-      }
-    },
-    []
-  );
-
-  useEffect(() => {
-    if (!isListening || !recognitionRef.current) {
-      if (periodicRestartRef.current) {
-        clearInterval(periodicRestartRef.current);
-        periodicRestartRef.current = null;
-      }
-      return;
-    }
-
-    periodicRestartRef.current = setInterval(() => {
-      if (!recognitionRef.current) return;
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        // Swallow errors; onend will attempt to restart when appropriate.
-      }
-    }, PERIODIC_RESTART_MS);
-
-    return () => {
-      if (periodicRestartRef.current) {
-        clearInterval(periodicRestartRef.current);
-        periodicRestartRef.current = null;
-      }
-    };
-  }, [isListening]);
-
-  const translateAndAnswerSegment = useCallback(
-    async (id: string, english: string, history: Segment[]) => {
-      setSegments((prev) =>
-        prev.map((segment) =>
-          segment.id === id
-            ? {
-                ...segment,
-                status: "translating",
-                answerStatus: "answering",
-                error: undefined,
-                answerError: undefined,
-              }
-            : segment
-        )
-      );
-
-      const translatePromise = fetch("/api/translate", {
+      void fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: english }),
+        signal: controller.signal,
       })
         .then(async (response) => {
           const payload = await response.json();
@@ -348,153 +98,194 @@ export function useSpeechFlow() {
           }
           return typeof payload.translation === "string" ? payload.translation : "";
         })
+        .then((translation) => {
+          if (controller.signal.aborted) return;
+          updateHistoryChinese(id, translation);
+          setSegments((prev) =>
+            prev.map((segment) =>
+              segment.id === id ? { ...segment, status: "done", chinese: translation } : segment
+            )
+          );
+        })
         .catch((err) => {
+          if (controller.signal.aborted) return;
           const message = err instanceof Error ? err.message : "翻译出现未知错误。";
-          throw new Error(message);
+          setSegments((prev) =>
+            prev.map((segment) =>
+              segment.id === id ? { ...segment, status: "error", error: message } : segment
+            )
+          );
+        })
+        .finally(() => {
+          removeAbortController(id, controller);
         });
+    },
+    [addAbortController, removeAbortController, updateHistoryChinese]
+  );
 
-      const answerHistory = history.map((seg) => ({
-        english: seg.english,
-        chinese: seg.chinese,
-      }));
+  // 判断是否问题并生成双语回答；与兜底翻译并行、互不等待。
+  const fetchAnswer = useCallback(
+    (id: string, english: string, history: Array<{ english: string; chinese: string }>) => {
+      const controller = new AbortController();
+      addAbortController(id, controller);
 
-      const answerPromise = fetch("/api/answer", {
+      void fetch("/api/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: english, history: answerHistory, customPrompt }),
+        body: JSON.stringify({ text: english, history, customPrompt: customPromptRef.current }),
+        signal: controller.signal,
       })
         .then(async (response) => {
-          const payload = await response.json();
+          const payload: AnswerResponsePayload = await response.json();
           if (!response.ok) {
             throw new Error(payload.error || "AI回答失败。");
           }
           return payload;
         })
+        .then((payload) => {
+          if (controller.signal.aborted) return;
+          setSegments((prev) =>
+            prev.map((segment) =>
+              segment.id === id
+                ? {
+                    ...segment,
+                    isQuestion: payload.isQuestion || false,
+                    answer: payload.answer || null,
+                    answerStatus: "done",
+                  }
+                : segment
+            )
+          );
+        })
         .catch((err) => {
+          if (controller.signal.aborted) return;
           const message = err instanceof Error ? err.message : "AI回答出现未知错误。";
-          throw new Error(message);
+          setSegments((prev) =>
+            prev.map((segment) =>
+              segment.id === id
+                ? { ...segment, answerStatus: "error", answerError: message }
+                : segment
+            )
+          );
+        })
+        .finally(() => {
+          removeAbortController(id, controller);
         });
-
-      try {
-        const translation = await translatePromise;
-        setSegments((prev) =>
-          prev.map((segment) =>
-            segment.id === id
-              ? {
-                  ...segment,
-                  status: "done",
-                  chinese: translation,
-                }
-              : segment
-          )
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "翻译出现未知错误。";
-        setSegments((prev) =>
-          prev.map((segment) =>
-            segment.id === id
-              ? {
-                  ...segment,
-                  status: "error",
-                  error: message,
-                }
-              : segment
-          )
-        );
-      }
-
-      try {
-        const answerData = await answerPromise;
-        setSegments((prev) =>
-          prev.map((segment) =>
-            segment.id === id
-              ? {
-                  ...segment,
-                  isQuestion: answerData.isQuestion || false,
-                  answer: answerData.answer || null,
-                  answerStatus: "done",
-                }
-              : segment
-          )
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "AI回答出现未知错误。";
-        setSegments((prev) =>
-          prev.map((segment) =>
-            segment.id === id
-              ? {
-                  ...segment,
-                  answerStatus: "error",
-                  answerError: message,
-                }
-              : segment
-          )
-        );
-      }
     },
-    [customPrompt]
+    [addAbortController, removeAbortController]
   );
 
-  const enqueueSegment = useCallback(
-    (english: string) => {
+  // 定稿句回调：底层给出的 chinese 非空时直接就位；为空串时本层兜底翻译一次。
+  // 无论中文是否已就位，都并行发起一次问答判断请求。updater 之外的两个请求各恰好触发一次。
+  const onFinalSegment = useCallback(
+    (english: string, chinese: string) => {
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      // 历史快照必须在把本轮写入 historyRef 之前取，天然不包含当前这一句。
+      const answerHistory = historyRef.current.slice(-5).map((item) => ({
+        english: item.english,
+        chinese: item.chinese,
+      }));
+
+      historyRef.current.push({ id, english, chinese });
+      if (historyRef.current.length > MAX_SEGMENTS) {
+        historyRef.current = historyRef.current.slice(historyRef.current.length - MAX_SEGMENTS);
+      }
+
+      const hasChinese = chinese !== "";
+      const segment: Segment = {
+        id,
+        english,
+        chinese: hasChinese ? chinese : null,
+        status: hasChinese ? "done" : "translating",
+        isQuestion: false,
+        answer: null,
+        answerStatus: "answering",
+      };
+
+      // 纯 updater：只做数组拼接与超限裁剪，不发起任何网络请求、不读写任何 ref。
       setSegments((prev) => {
-        const next: Segment[] = [
-          ...prev,
-          {
-            id,
-            english,
-            chinese: null,
-            status: "translating",
-            isQuestion: false,
-            answer: null,
-            answerStatus: "pending",
-          },
-        ];
-        translateAndAnswerSegment(id, english, next);
-        return next;
+        const next = [...prev, segment];
+        return next.length > MAX_SEGMENTS ? next.slice(next.length - MAX_SEGMENTS) : next;
       });
+
+      // F4：updater 之外维护同节奏裁剪的 id 列表；被裁掉的旧 segment 若仍有在途请求，
+      // 一并 abort 并从 abortMapRef 移除，避免网络卡住时 controller 永久泄漏。
+      segmentIdsRef.current.push(id);
+      if (segmentIdsRef.current.length > MAX_SEGMENTS) {
+        const overflow = segmentIdsRef.current.length - MAX_SEGMENTS;
+        const evictedIds = segmentIdsRef.current.slice(0, overflow);
+        segmentIdsRef.current = segmentIdsRef.current.slice(overflow);
+        for (const evictedId of evictedIds) {
+          const controllers = abortMapRef.current.get(evictedId);
+          if (!controllers) continue;
+          for (const controller of controllers) controller.abort();
+          abortMapRef.current.delete(evictedId);
+        }
+      }
+
+      if (!hasChinese) {
+        fetchTranslateFallback(id, english);
+      }
+      fetchAnswer(id, english, answerHistory);
     },
-    [translateAndAnswerSegment]
+    [fetchTranslateFallback, fetchAnswer]
   );
 
+  const {
+    isSupported,
+    isListening,
+    interimTranscript,
+    interimTranslation,
+    error: realtimeError,
+    start,
+    stop,
+  } = useRealtimeTranscription({ onFinalSegment });
+
+  // interim 直接转发底层的流式值：中文原生流式输出，不再需要防抖/去重/预览翻译请求。
+  const isTranslatingInterim = interimTranscript !== "" && interimTranslation === "";
+
+  // 与转写层的错误状态保持镜像，同时允许 handleClear/handleToggleListening 在不监听时本地清除展示。
   useEffect(() => {
-    enqueueSegmentRef.current = enqueueSegment;
-  }, [enqueueSegment]);
+    setError(realtimeError);
+  }, [realtimeError]);
 
-  const handleToggleListening = () => {
-    if (!isSupported || !recognitionRef.current) return;
+  // isListening 真正翻转（或转写层出现新错误导致的隐式失败）时，让意图标记与实际状态对齐，
+  // 避免“连接失败但意图仍为 true”导致后续点击被误判为重复请求而失效。
+  useEffect(() => {
+    if (!isListening) {
+      listenIntentRef.current = false;
+    }
+  }, [isListening, realtimeError]);
 
-    const recognition = recognitionRef.current;
+  // 组件卸载时取消所有在途的 translate/answer 请求。
+  useEffect(() => () => abortAllPending(), [abortAllPending]);
+
+  const handleToggleListening = useCallback(() => {
+    if (!isSupported) return;
 
     if (isListening) {
-      shouldResumeRef.current = false;
-      recognition.stop();
+      if (!listenIntentRef.current) return; // 已在停止中，忽略重复点击
+      listenIntentRef.current = false;
+      stop();
       return;
     }
 
-    try {
-      shouldResumeRef.current = true;
-      recognition.start();
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "无法启动语音识别，请稍后重试。";
-      setError(message);
-      shouldResumeRef.current = false;
-    }
-  };
-
-  const handleClear = () => {
-    if (isListening) return;
-    setSegments([]);
-    setInterimTranscript("");
-    setInterimTranslation("");
-    setIsTranslatingInterim(false);
-    setInterimAnswer(null);
-    setIsAnsweringInterim(false);
-    setInterimIsQuestion(false);
+    if (listenIntentRef.current) return; // 已在连接中，忽略重复点击
+    listenIntentRef.current = true;
     setError(null);
-  };
+    start();
+  }, [isSupported, isListening, start, stop]);
+
+  const handleClear = useCallback(() => {
+    if (isListening) return;
+
+    abortAllPending();
+    historyRef.current = [];
+    segmentIdsRef.current = [];
+    setSegments([]);
+    setError(null);
+  }, [isListening, abortAllPending]);
 
   return {
     isSupported,
@@ -502,9 +293,9 @@ export function useSpeechFlow() {
     interimTranscript,
     interimTranslation,
     isTranslatingInterim,
-    interimAnswer,
-    isAnsweringInterim,
-    interimIsQuestion,
+    interimAnswer: null,
+    isAnsweringInterim: false,
+    interimIsQuestion: false,
     segments,
     error,
     customPrompt,

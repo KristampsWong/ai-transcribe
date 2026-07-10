@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4.1-mini",
         temperature: 0.2,
         messages: [
           {
@@ -49,6 +49,7 @@ export async function POST(req: NextRequest) {
           { role: "user", content: body.text.trim() },
         ],
       }),
+      signal: req.signal,
     });
 
     const translationData = await chatResponse.json();

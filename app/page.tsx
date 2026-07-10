@@ -54,13 +54,13 @@ export default function Home() {
             实时语音翻译 & AI 助手
           </h1>
           <p className="text-slate-300">
-            通过浏览器语音识别实时获取英文语音，并使用 GPT-4o 翻译成中文。AI 会自动检测问题并给出回答。
+            通过 OpenAI 实时转写获取英文语音，并使用 GPT 翻译成中文。AI 会自动检测问题并给出回答。
           </p>
         </header>
 
         {!isSupported ? (
           <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
-            当前浏览器不支持 Web Speech API。请尝试使用最新版本的 Chrome 或 Edge。
+            当前浏览器不支持麦克风/WebRTC。请尝试使用最新版本的 Chrome 或 Edge。
           </div>
         ) : null}
 

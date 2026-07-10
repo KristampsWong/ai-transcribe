@@ -49,7 +49,7 @@ export async function POST(request: NextRequest) {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4.1-mini",
         messages: [
           {
             role: "system",
@@ -64,6 +64,7 @@ export async function POST(request: NextRequest) {
         temperature: 0.1,
         max_tokens: 10,
       }),
+      signal: request.signal,
     });
 
     if (!detectionResponse.ok) {
@@ -94,7 +95,7 @@ export async function POST(request: NextRequest) {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: "gpt-4.1-mini",
         messages: [
           {
             role: "system",
@@ -109,6 +110,7 @@ export async function POST(request: NextRequest) {
         temperature: 0.7,
         max_tokens: 500,
       }),
+      signal: request.signal,
     });
 
     if (!answerResponse.ok) {

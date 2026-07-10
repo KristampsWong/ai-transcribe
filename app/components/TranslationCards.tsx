@@ -17,7 +17,11 @@ export function TranslationSegmentCard({ segment }: TranslationSegmentCardProps)
       <p className="mt-1 text-sm text-slate-100 whitespace-pre-wrap">{segment.english}</p>
       <p className="mt-3 text-sm font-medium text-slate-300">中文翻译</p>
       {segment.status === "translating" ? (
-        <p className="mt-1 text-sm text-slate-400">GPT 翻译中…</p>
+        segment.chinese ? (
+          <p className="mt-1 text-sm text-slate-100 whitespace-pre-wrap">{segment.chinese}</p>
+        ) : (
+          <p className="mt-1 text-sm text-slate-400">GPT 翻译中…</p>
+        )
       ) : null}
       {segment.status === "done" ? (
         <p className="mt-1 text-sm text-slate-100 whitespace-pre-wrap">{segment.chinese}</p>

@@ -79,46 +79,79 @@ export function useSpeechFlow() {
     if (entry) entry.chinese = chinese;
   }, []);
 
-  // 兜底翻译：仅在底层未能在超时内给出中文输出流时调用（chinese === ""）。
-  const fetchTranslateFallback = useCallback(
+  // 主翻译路径：每个 final segment 调用一次 SSE 流式 /api/translate，逐块累积中文并回填。
+  // 中文全部来自这里——realtime 层不再提供任何中文，onFinalSegment 只给英文。
+  const fetchTranslateStream = useCallback(
     (id: string, english: string) => {
       const controller = new AbortController();
       addAbortController(id, controller);
 
-      void fetch("/api/translate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: english }),
-        signal: controller.signal,
-      })
-        .then(async (response) => {
-          const payload = await response.json();
+      void (async () => {
+        try {
+          const response = await fetch("/api/translate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: english }),
+            signal: controller.signal,
+          });
+
           if (!response.ok) {
-            throw new Error(payload.error || "翻译失败，请稍后重试。");
+            let message = "翻译失败，请稍后重试。";
+            try {
+              const payload = await response.json();
+              if (typeof payload?.error === "string") message = payload.error;
+            } catch {
+              // 上游未返回可解析的 JSON 错误体，使用默认文案。
+            }
+            throw new Error(message);
           }
-          return typeof payload.translation === "string" ? payload.translation : "";
-        })
-        .then((translation) => {
+
+          if (!response.body) {
+            throw new Error("翻译响应缺少数据流。");
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let accumulated = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (controller.signal.aborted) return; // abort 后不再回填
+
+            const chunk = decoder.decode(value, { stream: true });
+            if (!chunk) continue;
+
+            // 累积拼接：每次都用完整的累积文本覆盖 chinese 字段，而不是只写入最新的一块。
+            accumulated += chunk;
+            const nextChinese = accumulated;
+            setSegments((prev) =>
+              prev.map((segment) =>
+                segment.id === id ? { ...segment, chinese: nextChinese } : segment
+              )
+            );
+          }
+
           if (controller.signal.aborted) return;
-          updateHistoryChinese(id, translation);
+
+          updateHistoryChinese(id, accumulated);
           setSegments((prev) =>
             prev.map((segment) =>
-              segment.id === id ? { ...segment, status: "done", chinese: translation } : segment
+              segment.id === id ? { ...segment, status: "done", chinese: accumulated } : segment
             )
           );
-        })
-        .catch((err) => {
-          if (controller.signal.aborted) return;
+        } catch (err) {
+          if (controller.signal.aborted) return; // abort 触发的 reader 异常静默吞掉
           const message = err instanceof Error ? err.message : "翻译出现未知错误。";
           setSegments((prev) =>
             prev.map((segment) =>
               segment.id === id ? { ...segment, status: "error", error: message } : segment
             )
           );
-        })
-        .finally(() => {
+        } finally {
           removeAbortController(id, controller);
-        });
+        }
+      })();
     },
     [addAbortController, removeAbortController, updateHistoryChinese]
   );
@@ -175,10 +208,10 @@ export function useSpeechFlow() {
     [addAbortController, removeAbortController]
   );
 
-  // 定稿句回调：底层给出的 chinese 非空时直接就位；为空串时本层兜底翻译一次。
-  // 无论中文是否已就位，都并行发起一次问答判断请求。updater 之外的两个请求各恰好触发一次。
+  // 定稿句回调：底层只给英文（realtime 层不再产出任何中文）。先同步追加一个
+  // status:"translating"、chinese:"" 的 segment，再并行发起一次流式翻译 + 一次问答判断请求。
   const onFinalSegment = useCallback(
-    (english: string, chinese: string) => {
+    (english: string) => {
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
       // 历史快照必须在把本轮写入 historyRef 之前取，天然不包含当前这一句。
@@ -187,17 +220,16 @@ export function useSpeechFlow() {
         chinese: item.chinese,
       }));
 
-      historyRef.current.push({ id, english, chinese });
+      historyRef.current.push({ id, english, chinese: "" });
       if (historyRef.current.length > MAX_SEGMENTS) {
         historyRef.current = historyRef.current.slice(historyRef.current.length - MAX_SEGMENTS);
       }
 
-      const hasChinese = chinese !== "";
       const segment: Segment = {
         id,
         english,
-        chinese: hasChinese ? chinese : null,
-        status: hasChinese ? "done" : "translating",
+        chinese: "",
+        status: "translating",
         isQuestion: false,
         answer: null,
         answerStatus: "answering",
@@ -224,26 +256,25 @@ export function useSpeechFlow() {
         }
       }
 
-      if (!hasChinese) {
-        fetchTranslateFallback(id, english);
-      }
+      fetchTranslateStream(id, english);
       fetchAnswer(id, english, answerHistory);
     },
-    [fetchTranslateFallback, fetchAnswer]
+    [fetchTranslateStream, fetchAnswer]
   );
 
   const {
     isSupported,
     isListening,
     interimTranscript,
-    interimTranslation,
     error: realtimeError,
     start,
     stop,
   } = useRealtimeTranscription({ onFinalSegment });
 
-  // interim 直接转发底层的流式值：中文原生流式输出，不再需要防抖/去重/预览翻译请求。
-  const isTranslatingInterim = interimTranscript !== "" && interimTranslation === "";
+  // 底层不再提供任何中文流式预览：interim 卡片只展示流式英文，中文在句子定稿后
+  // 立刻在 segment 卡片里逐块流式冒出（这是设计意图，而非缺失功能）。
+  const interimTranslation = "";
+  const isTranslatingInterim = false;
 
   // 与转写层的错误状态保持镜像，同时允许 handleClear/handleToggleListening 在不监听时本地清除展示。
   useEffect(() => {

@@ -1,13 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const OPENAI_REALTIME_CLIENT_SECRETS_URL =
-  "https://api.openai.com/v1/realtime/translations/client_secrets";
-// 翻译会话模型（2026-05 发布）：单会话同时流式输出英文转写 + 中文翻译。
-const REALTIME_TRANSLATE_MODEL = "gpt-realtime-translate";
-// 源语（英文）转写子模型。
+  "https://api.openai.com/v1/realtime/client_secrets";
+// 纯转写会话模型：原生流式转写，delta 随音频到达即时下发（不像 gpt-4o-transcribe 要等 commit）。
+// 已通过实测校验（2026-07-10）确认 client_secrets 接口接受该 body。
 const REALTIME_TRANSCRIBE_MODEL = "gpt-realtime-whisper";
-// 目标翻译语言：中文。已通过实测校验（2026-07-09）确认 client_secrets 接口接受该代码。
-const OUTPUT_LANGUAGE = "zh";
 
 export async function GET(request: NextRequest) {
   if (!process.env.OPENAI_API_KEY) {
@@ -28,13 +25,15 @@ export async function GET(request: NextRequest) {
         },
         body: JSON.stringify({
           session: {
-            model: REALTIME_TRANSLATE_MODEL,
+            type: "transcription",
             audio: {
               input: {
-                transcription: { model: REALTIME_TRANSCRIBE_MODEL },
                 noise_reduction: { type: "near_field" },
+                transcription: { model: REALTIME_TRANSCRIBE_MODEL, language: "en" },
+                // 转写会话不支持 VAD：turn_detection 必须省略或为 null，
+                // 分段改由客户端静音检测 + 手动 input_audio_buffer.commit 完成。
+                turn_detection: null,
               },
-              output: { language: OUTPUT_LANGUAGE },
             },
           },
         }),

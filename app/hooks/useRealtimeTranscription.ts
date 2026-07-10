@@ -5,15 +5,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { RealtimeServerEvent } from "@/types/realtime";
 
 export type RealtimeTranscriptionOptions = {
-  // 一轮说话定稿时触发。english 已 trim 非空；chinese 可能为空串（输出流缺失/超时兜底时）。
-  onFinalSegment: (english: string, chinese: string) => void;
+  // 一段语音 commit 后转写定稿时触发。english 已 trim 非空。
+  onFinalSegment: (englishText: string) => void;
 };
 
 export type RealtimeTranscriptionApi = {
   isSupported: boolean;
   isListening: boolean;
-  interimTranscript: string; // 流式英文（input_transcript delta 累积）
-  interimTranslation: string; // 流式中文（output_transcript delta 累积）
+  interimTranscript: string; // 流式英文（转写 delta 累积）
   error: string | null; // 简体中文
   start: () => void;
   stop: () => void;
@@ -22,7 +21,7 @@ export type RealtimeTranscriptionApi = {
 type Timer = ReturnType<typeof setTimeout>;
 
 const REALTIME_TOKEN_ENDPOINT = "/api/realtime-token";
-const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/translations/calls";
+const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY_MS = 500;
@@ -30,21 +29,21 @@ const RECONNECT_MAX_DELAY_MS = 8000;
 
 // 单轮累积文本上限：防止不换气长说话把内存撑爆（超限保留尾部，即最新内容）。
 const MAX_BUFFER_CHARS = 20000;
-// input done 之后等待配对的 output done 的超时：避免翻译输出流缺失时永久卡住。
-const PENDING_OUTPUT_TIMEOUT_MS = 3000;
-// 孤立的 output done（迟迟等不到配对 input）的存活上限：超时直接丢弃，不参与任何配对，
-// 避免被后续无关轮次的 input 误配（F1）。
-const PENDING_ORPHAN_OUTPUT_TTL_MS = 10000;
-// pendingInputs / pendingOutputs 队列容量上限兜底：正常情况下各自的超时机制会及时清空队列，
-// 这里只是防御极端场景（定时器堆积、事件风暴）下内存无限增长。
-const MAX_PENDING_QUEUE_LENGTH = 20;
-// 已超时定稿的 input id“墓碑”集合上限：超出后淘汰最旧的记录。
-const MAX_TIMED_OUT_ID_TOMBSTONES = 20;
 
 const DEFAULT_TURN_KEY = "__default__";
 
+// ---- 客户端静音检测 + 手动分段 ----
+// gpt-realtime-whisper 转写会话不支持 VAD（turn_detection 恒为 null），分段职责转移到客户端：
+// 用 AnalyserNode 周期性采样麦克风 RMS 音量，判定“说话中 -> 静音持续一段时间”后
+// 主动通过数据通道发 input_audio_buffer.commit，让服务端把当前缓冲定稿并清空。
+const SPEECH_THRESHOLD = 0.02; // RMS 音量阈值：高于此值视为“说话中”
+const SILENCE_COMMIT_MS = 700; // 说话中检测到静音连续超过该时长即手动 commit 分段
+const MAX_UTTERANCE_MS = 15000; // 单句持续说话超过该上限也强制 commit，防止一句永不定稿
+const SILENCE_SAMPLE_INTERVAL_MS = 80; // 静音检测采样间隔
+const ANALYSER_FFT_SIZE = 512; // 足够小，兼顾 80ms 采样节奏下的实时性与开销
+
 // ---- 事件字段防御性读取 ----
-// translations 会话事件的具体字段名文档未完全锁定，这里统一用“候选字段名依次尝试”的方式读取，
+// 转写会话事件的具体字段名文档未完全锁定，这里统一用“候选字段名依次尝试”的方式读取，
 // 不依赖 TypeScript 的 switch 判别式收窄（联合类型里混了一个宽松的 { type: string } 兜底成员，
 // 会污染窄化结果），全部走运行时安全读取。
 function readEventText(event: RealtimeServerEvent, keys: readonly string[]): string {
@@ -58,7 +57,7 @@ function readEventText(event: RealtimeServerEvent, keys: readonly string[]): str
 
 function readEventId(event: RealtimeServerEvent): string | undefined {
   const record = event as unknown as Record<string, unknown>;
-  const candidates = [record.item_id, record.turn_id, record.id];
+  const candidates = [record.item_id, record.id];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate) return candidate;
   }
@@ -85,19 +84,12 @@ function appendCapped(map: Map<string, string>, key: string, chunk: string) {
   map.set(key, capText(previous + chunk));
 }
 
-type PendingDone = {
-  text: string;
-  id?: string;
-  timer?: Timer;
-};
-
 export function useRealtimeTranscription(
   options: RealtimeTranscriptionOptions
 ): RealtimeTranscriptionApi {
   const [isSupported, setIsSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
-  const [interimTranslation, setInterimTranslation] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   // 用 ref 持有最新回调，避免回调身份变化触发连接重建。
@@ -127,26 +119,22 @@ export function useRealtimeTranscription(
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<Timer | null>(null);
 
-  // 按 item/turn id（缺失时用默认 key）累积 delta 文本，用于 UI 展示的 interim 状态。
+  // 按 item id（缺失时用默认 key）累积转写 delta 文本，用于 UI 展示的 interim 状态。
   const inputDeltaMapRef = useRef<Map<string, string>>(new Map());
-  const outputDeltaMapRef = useRef<Map<string, string>>(new Map());
 
-  // 定稿配对队列：done 事件到达后入队，双方都有待配对项时按 id（若都带）或顺序（FIFO）配对。
-  const pendingInputsRef = useRef<PendingDone[]>([]);
-  const pendingOutputsRef = useRef<PendingDone[]>([]);
+  // 静音检测相关状态。
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const silenceIntervalRef = useRef<Timer | null>(null);
+  const silenceSampleBufferRef = useRef<Float32Array<ArrayBuffer> | null>(null);
+  const hasSpeechSinceCommitRef = useRef(false); // 自上次 commit 以来是否检测到过“说话中”
+  const belowThresholdSinceRef = useRef<number | null>(null); // 本轮静音连续开始的时间戳
+  const speechStartRef = useRef<number | null>(null); // 本轮说话开始的时间戳（用于 MAX_UTTERANCE_MS）
 
-  // F1：input 因等不到配对 output 而超时/被挤出队列强制定稿后，记录其 id“墓碑”；
-  // 之后同 id 的迟到 output 一律直接丢弃，不再落入下一轮的 FIFO 配对（防止错配级联）。
-  const timedOutInputIdsRef = useRef<Set<string>>(new Set());
-
-  // F6：input done 后英文文本已经从 inputDeltaMapRef 移出，但该轮尚未真正 finalize
-  // （配对成功或超时）时，仍需要参与 interimTranscript 展示，避免中文还在流式时字幕先闪没。
-  const pendingDisplayEnglishRef = useRef<Map<string, string>>(new Map());
-
-  // F2：组件卸载后，任何仍在途的定时器回调都不应再触发 onFinalSegment（上层可能已经 abort 收尾）。
+  // 组件卸载后，任何仍在途的异步回调都不应再触发 onFinalSegment（上层可能已经 abort 收尾）。
   const disposedRef = useRef(false);
 
-  // F5：未建模事件类型只打一次日志，避免高频未知事件刷屏控制台。
+  // 未建模事件类型只打一次日志，避免高频未知事件刷屏控制台。
   const seenUnknownEventTypesRef = useRef<Set<string>>(new Set());
 
   const connectRef = useRef<() => void>(() => {});
@@ -162,191 +150,170 @@ export function useRealtimeTranscription(
   }, []);
 
   const recomputeInterimTranscript = useCallback(() => {
-    // F6：待定稿展示缓冲（本轮英文已 done 但尚未真正 finalize）排在前面，
-    // 再拼接仍在流式的下一轮英文，避免中文还在流式时字幕先闪没。
-    const pendingDisplay = Array.from(pendingDisplayEnglishRef.current.values());
-    const live = Array.from(inputDeltaMapRef.current.values());
-    const merged = [...pendingDisplay, ...live].join(" ").trim();
+    const merged = Array.from(inputDeltaMapRef.current.values()).join(" ").trim();
     setInterimTranscript(merged);
   }, []);
 
-  const recomputeInterimTranslation = useCallback(() => {
-    const merged = Array.from(outputDeltaMapRef.current.values()).join(" ").trim();
-    setInterimTranslation(merged);
-  }, []);
-
-  // 清空所有轮次相关的缓冲/队列/定时器与两个 interim 状态。
+  // 清空转写相关的缓冲与 interim 状态。
   // 用于 start() 前的初始化、新连接建立（dc open）时丢弃上一次连接的残留状态、以及 stop()。
   const resetTurnState = useCallback(() => {
     inputDeltaMapRef.current.clear();
-    outputDeltaMapRef.current.clear();
-    for (const pending of pendingInputsRef.current) {
-      if (pending.timer) clearTimeout(pending.timer);
-    }
-    for (const pending of pendingOutputsRef.current) {
-      if (pending.timer) clearTimeout(pending.timer);
-    }
-    pendingInputsRef.current = [];
-    pendingOutputsRef.current = [];
-    timedOutInputIdsRef.current.clear();
-    pendingDisplayEnglishRef.current.clear();
     setInterimTranscript("");
-    setInterimTranslation("");
   }, []);
 
-  const finalizeSegment = useCallback((english: string, chinese: string) => {
-    if (disposedRef.current) return; // F2：已卸载，绝不再触发上层回调（上层可能已 abort 收尾）
+  const finalizeSegment = useCallback((english: string) => {
+    if (disposedRef.current) return; // 已卸载，绝不再触发上层回调（上层可能已 abort 收尾）
     const trimmedEnglish = english.trim();
     if (!trimmedEnglish) return; // 契约：english 已 trim 非空才回调
-    onFinalSegmentRef.current(trimmedEnglish, chinese.trim());
+    onFinalSegmentRef.current(trimmedEnglish);
   }, []);
 
-  // F1：input 因超时或队列容量兜底被强制定稿时的统一出口——记墓碑、清 F6 展示缓冲、真正 finalize。
-  // 墓碑集合有容量上限，超出淘汰最旧记录（Set 的插入顺序即淘汰顺序）。
-  const finalizeInputAsTimedOut = useCallback(
-    (entry: PendingDone) => {
-      if (entry.id) {
-        const tombstones = timedOutInputIdsRef.current;
-        tombstones.delete(entry.id);
-        tombstones.add(entry.id);
-        if (tombstones.size > MAX_TIMED_OUT_ID_TOMBSTONES) {
-          const oldest = tombstones.values().next().value;
-          if (oldest !== undefined) tombstones.delete(oldest);
-        }
-      }
-      if (pendingDisplayEnglishRef.current.delete(entry.id ?? DEFAULT_TURN_KEY)) {
-        recomputeInterimTranscript();
-      }
-      finalizeSegment(entry.text, "");
-    },
-    [finalizeSegment, recomputeInterimTranscript]
-  );
-
-  // 尝试把 pendingInputs 与 pendingOutputs 中的待配对项两两配对并定稿，优先按 id 精确匹配；
-  // 仅当队首 input 与队首 output 双方都没有 id 时才退化为顺序（FIFO）配对——任何一方带 id
-  // 而找不到精确匹配，都继续等待，绝不把两个各自带不同（非空）id 的项按位置配对（F1-1）。
-  const tryMatchAndFinalize = useCallback(() => {
-    const inputs = pendingInputsRef.current;
-    const outputs = pendingOutputsRef.current;
-
-    while (inputs.length > 0 && outputs.length > 0) {
-      let inputIdx = -1;
-      let outputIdx = -1;
-
-      for (let i = 0; i < inputs.length; i++) {
-        const id = inputs[i].id;
-        if (!id) continue;
-        const j = outputs.findIndex((o) => o.id === id);
-        if (j !== -1) {
-          inputIdx = i;
-          outputIdx = j;
-          break;
-        }
-      }
-
-      if (inputIdx === -1) {
-        if (!inputs[0].id && !outputs[0].id) {
-          // 双方队首都没有 id：可以安全地按位置（FIFO）配对。
-          inputIdx = 0;
-          outputIdx = 0;
-        } else {
-          // 队首至少一方带 id 但没能精确匹配：不做危险的位置配对，继续等待。
-          break;
-        }
-      }
-
-      const [inputEntry] = inputs.splice(inputIdx, 1);
-      const [outputEntry] = outputs.splice(outputIdx, 1);
-      if (inputEntry.timer) clearTimeout(inputEntry.timer);
-      if (outputEntry.timer) clearTimeout(outputEntry.timer);
-      if (pendingDisplayEnglishRef.current.delete(inputEntry.id ?? DEFAULT_TURN_KEY)) {
-        recomputeInterimTranscript();
-      }
-      finalizeSegment(inputEntry.text, outputEntry.text);
+  // 通过数据通道发送 input_audio_buffer.commit，让服务端把当前缓冲定稿并清空。
+  // 两道防线：hasSpeechSinceCommitRef 为 false（自上次 commit 以来还没检测到说话）时绝不发送，
+  // 避免空缓冲 commit 报错；dc 未 open 时也不发送。发送后立即重置说话状态，等待下一句。
+  const attemptCommit = useCallback(() => {
+    if (!hasSpeechSinceCommitRef.current) return;
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== "open") return;
+    try {
+      dc.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    } catch {
+      // dc 可能在发送瞬间关闭，忽略；下一句说话仍会重新走一遍状态机。
     }
-  }, [finalizeSegment, recomputeInterimTranscript]);
+    hasSpeechSinceCommitRef.current = false;
+    belowThresholdSinceRef.current = null;
+    speechStartRef.current = null;
+  }, []);
 
-  const enqueuePendingInput = useCallback(
-    (text: string, id?: string) => {
-      const entry: PendingDone = { text, id };
-      entry.timer = setTimeout(() => {
-        const idx = pendingInputsRef.current.indexOf(entry);
-        if (idx !== -1) {
-          pendingInputsRef.current.splice(idx, 1);
-          // 输出流迟迟不来：以 chinese="" 兜底触发，避免卡住（F1-2：同时记墓碑防止迟到 output 误配）。
-          finalizeInputAsTimedOut(entry);
-        }
-      }, PENDING_OUTPUT_TIMEOUT_MS);
-      pendingInputsRef.current.push(entry);
-      if (pendingInputsRef.current.length > MAX_PENDING_QUEUE_LENGTH) {
-        // F1-3 兜底：正常不会走到这里（超时定时器会及时清空），仅防御极端事件风暴。
-        const [oldest] = pendingInputsRef.current.splice(0, 1);
-        if (oldest.timer) clearTimeout(oldest.timer);
-        finalizeInputAsTimedOut(oldest);
+  // 静音检测状态机：每 SILENCE_SAMPLE_INTERVAL_MS 采样一次麦克风 RMS 音量。
+  // RMS > 阈值：记为“说话中”；说话中且 RMS 持续低于阈值达 SILENCE_COMMIT_MS：手动 commit；
+  // 说话持续超过 MAX_UTTERANCE_MS：强制 commit，防止一句永不定稿。
+  const sampleSilenceDetection = useCallback(() => {
+    const analyser = analyserRef.current;
+    const buffer = silenceSampleBufferRef.current;
+    if (!analyser || !buffer) return;
+
+    analyser.getFloatTimeDomainData(buffer);
+    let sumSquares = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      sumSquares += buffer[i] * buffer[i];
+    }
+    const rms = Math.sqrt(sumSquares / buffer.length);
+    const now = Date.now();
+
+    if (rms > SPEECH_THRESHOLD) {
+      belowThresholdSinceRef.current = null;
+      if (!hasSpeechSinceCommitRef.current) {
+        speechStartRef.current = now;
       }
-      tryMatchAndFinalize();
+      hasSpeechSinceCommitRef.current = true;
+    } else if (hasSpeechSinceCommitRef.current) {
+      if (belowThresholdSinceRef.current === null) {
+        belowThresholdSinceRef.current = now;
+      } else if (now - belowThresholdSinceRef.current >= SILENCE_COMMIT_MS) {
+        attemptCommit();
+        return; // 本 tick 已处理完毕，无需再检查 MAX_UTTERANCE_MS。
+      }
+    }
+
+    if (
+      hasSpeechSinceCommitRef.current &&
+      speechStartRef.current !== null &&
+      now - speechStartRef.current >= MAX_UTTERANCE_MS
+    ) {
+      attemptCommit();
+    }
+  }, [attemptCommit]);
+
+  // 连接建立后调用：在麦克风 MediaStream 上挂 AudioContext + AnalyserNode，启动采样定时器。
+  // 初始化失败（如浏览器不支持 AudioContext）不应阻断转写主链路，静默降级即可——
+  // 后果仅是失去自动分段能力，转写本身仍然正常工作。
+  const setupSilenceDetection = useCallback(
+    (stream: MediaStream) => {
+      try {
+        if (typeof window === "undefined" || !window.AudioContext) return;
+        const audioContext = new window.AudioContext();
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = ANALYSER_FFT_SIZE;
+        source.connect(analyser);
+
+        audioContextRef.current = audioContext;
+        analyserRef.current = analyser;
+        silenceSampleBufferRef.current = new Float32Array(analyser.fftSize);
+        hasSpeechSinceCommitRef.current = false;
+        belowThresholdSinceRef.current = null;
+        speechStartRef.current = null;
+
+        silenceIntervalRef.current = setInterval(
+          sampleSilenceDetection,
+          SILENCE_SAMPLE_INTERVAL_MS
+        );
+      } catch {
+        // 静默降级，见上方注释。
+      }
     },
-    [finalizeInputAsTimedOut, tryMatchAndFinalize]
+    [sampleSilenceDetection]
   );
 
-  const enqueuePendingOutput = useCallback(
-    (text: string, id?: string) => {
-      // F1-2：该 id 对应的 input 已经因超时（或容量兜底）强制定稿过，这是一条迟到的 output，
-      // 直接丢弃，绝不能落入 FIFO 被配给下一轮 input。
-      if (id && timedOutInputIdsRef.current.has(id)) {
-        console.debug("[realtime] 丢弃迟到的 output（对应 input 已超时定稿）：", id);
-        return;
-      }
-
-      const entry: PendingDone = { text, id };
-      entry.timer = setTimeout(() => {
-        // F1-3：长时间配不到对应 input 的孤立 output，直接丢弃（不定稿），避免污染后续轮次。
-        const idx = pendingOutputsRef.current.indexOf(entry);
-        if (idx !== -1) pendingOutputsRef.current.splice(idx, 1);
-      }, PENDING_ORPHAN_OUTPUT_TTL_MS);
-      pendingOutputsRef.current.push(entry);
-      if (pendingOutputsRef.current.length > MAX_PENDING_QUEUE_LENGTH) {
-        // F1-3 容量兜底：淘汰最旧的孤立 output。
-        const [oldest] = pendingOutputsRef.current.splice(0, 1);
-        if (oldest.timer) clearTimeout(oldest.timer);
-      }
-      tryMatchAndFinalize();
-    },
-    [tryMatchAndFinalize]
-  );
+  // 停止采样定时器并关闭 AudioContext（close() 返回 Promise，吞掉异常——
+  // 可能已处于关闭中或已关闭）。重置所有静音检测状态，供下一次连接重新初始化。
+  const teardownSilenceDetection = useCallback(() => {
+    if (silenceIntervalRef.current) {
+      clearInterval(silenceIntervalRef.current);
+      silenceIntervalRef.current = null;
+    }
+    analyserRef.current = null;
+    silenceSampleBufferRef.current = null;
+    hasSpeechSinceCommitRef.current = false;
+    belowThresholdSinceRef.current = null;
+    speechStartRef.current = null;
+    const ctx = audioContextRef.current;
+    audioContextRef.current = null;
+    if (ctx && ctx.state !== "closed") {
+      ctx.close().catch(() => {
+        // 忽略：可能已在关闭中或已关闭。
+      });
+    }
+  }, []);
 
   // 关闭当前 pc/dc（先摘除监听器/abort 在途 fetch，再 close，避免自触发的事件被当成意外断开）。
   // stopMic=true 时一并停止麦克风轨道，仅用于用户主动 stop / 卸载 / 权限被拒等终态场景。
-  const cleanupConnection = useCallback((stopMic: boolean) => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-    if (connectionAbortRef.current) {
-      connectionAbortRef.current.abort();
-      connectionAbortRef.current = null;
-    }
-    if (dcRef.current) {
-      try {
-        dcRef.current.close();
-      } catch {
-        // 幂等：可能已处于关闭状态。
+  const cleanupConnection = useCallback(
+    (stopMic: boolean) => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
-      dcRef.current = null;
-    }
-    if (pcRef.current) {
-      try {
-        pcRef.current.close();
-      } catch {
-        // 幂等：可能已处于关闭状态。
+      if (connectionAbortRef.current) {
+        connectionAbortRef.current.abort();
+        connectionAbortRef.current = null;
       }
-      pcRef.current = null;
-    }
-    if (stopMic && streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-  }, []);
+      // 停止时若最后一句未攒够静音间隔，该句会被放弃（监听器已随连接拆除）。
+      teardownSilenceDetection();
+      if (dcRef.current) {
+        try {
+          dcRef.current.close();
+        } catch {
+          // 幂等：可能已处于关闭状态。
+        }
+        dcRef.current = null;
+      }
+      if (pcRef.current) {
+        try {
+          pcRef.current.close();
+        } catch {
+          // 幂等：可能已处于关闭状态。
+        }
+        pcRef.current = null;
+      }
+      if (stopMic && streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+    },
+    [teardownSilenceDetection]
+  );
 
   const scheduleReconnect = useCallback(() => {
     if (!shouldReconnectRef.current) return;
@@ -357,7 +324,7 @@ export function useRealtimeTranscription(
       cleanupConnection(false);
       shouldReconnectRef.current = false;
       setIsListening(false);
-      setError("与实时翻译服务的连接多次失败，请检查网络后重新开始。");
+      setError("与实时转写服务的连接多次失败，请检查网络后重新开始。");
       return;
     }
 
@@ -366,7 +333,7 @@ export function useRealtimeTranscription(
       RECONNECT_MAX_DELAY_MS
     );
 
-    // F3：进入退避倒计时期间连接已死，UI 不应继续显示“监听中”；重连成功（dc open）时再恢复。
+    // 进入退避倒计时期间连接已死，UI 不应继续显示“监听中”；重连成功（dc open）时再恢复。
     setIsListening(false);
     cleanupConnection(false);
 
@@ -380,53 +347,31 @@ export function useRealtimeTranscription(
   const handleServerEvent = useCallback(
     (event: RealtimeServerEvent) => {
       switch (event.type) {
-        case "session.input_transcript.delta": {
+        case "conversation.item.input_audio_transcription.delta": {
           const key = readEventId(event) ?? DEFAULT_TURN_KEY;
           appendCapped(inputDeltaMapRef.current, key, readEventText(event, ["delta", "text"]));
           recomputeInterimTranscript();
           break;
         }
-        case "session.input_transcript.done": {
+        case "conversation.item.input_audio_transcription.completed": {
           const id = readEventId(event);
           const key = id ?? DEFAULT_TURN_KEY;
           let finalText = readEventText(event, ["transcript", "text"]);
           if (!finalText) finalText = inputDeltaMapRef.current.get(key) ?? "";
           if (!finalText) {
-            console.debug("[realtime] input_transcript.done 未找到文本字段，原始事件：", event);
+            console.debug(
+              "[realtime] input_audio_transcription.completed 未找到文本字段，原始事件：",
+              event
+            );
           }
           inputDeltaMapRef.current.delete(key);
-          // F6：本轮英文尚未真正 finalize（配对成功或超时）前，移入待定稿展示缓冲继续参与
-          // interimTranscript，避免中文仍在流式时字幕先闪没；finalize 时才真正清除（见配对/超时逻辑）。
-          if (finalText) {
-            pendingDisplayEnglishRef.current.set(key, capText(finalText));
-          }
           recomputeInterimTranscript();
-          enqueuePendingInput(capText(finalText), id);
-          break;
-        }
-        case "session.output_transcript.delta": {
-          const key = readEventId(event) ?? DEFAULT_TURN_KEY;
-          appendCapped(outputDeltaMapRef.current, key, readEventText(event, ["delta", "text"]));
-          recomputeInterimTranslation();
-          break;
-        }
-        case "session.output_transcript.done": {
-          const id = readEventId(event);
-          const key = id ?? DEFAULT_TURN_KEY;
-          let finalText = readEventText(event, ["transcript", "text"]);
-          if (!finalText) finalText = outputDeltaMapRef.current.get(key) ?? "";
-          outputDeltaMapRef.current.delete(key);
-          recomputeInterimTranslation();
-          enqueuePendingOutput(capText(finalText), id);
-          break;
-        }
-        case "session.output_audio.delta": {
-          // 中文语音 base64：本项目忽略，不播放。
+          finalizeSegment(capText(finalText));
           break;
         }
         case "error": {
           const message = readEventErrorMessage(event);
-          setError(message ? `翻译服务返回异常：${message}` : "翻译服务返回未知异常。");
+          setError(message ? `转写服务返回异常：${message}` : "转写服务返回未知异常。");
           setIsListening(false);
           // 服务端 error 后连接可能已不可用：拆掉当前连接并计入退避次数重连，
           // 不能只设文案让 UI 停在“显示监听中但会话已死”的状态。
@@ -437,7 +382,8 @@ export function useRealtimeTranscription(
           break;
         }
         default: {
-          // F5：未建模的事件类型。高频的 .delta 后缀事件完全静默；其余每种 type 只打一次，
+          // 未建模的事件类型（如 session.created、input_audio_buffer.committed 等）。
+          // 高频的 .delta 后缀事件完全静默；其余每种 type 只打一次，
           // 首次出现打完整事件体方便真机联调时校正字段名，避免刷屏。
           const unknownType = event.type;
           if (!unknownType.endsWith(".delta") && !seenUnknownEventTypesRef.current.has(unknownType)) {
@@ -448,14 +394,7 @@ export function useRealtimeTranscription(
         }
       }
     },
-    [
-      recomputeInterimTranscript,
-      recomputeInterimTranslation,
-      enqueuePendingInput,
-      enqueuePendingOutput,
-      cleanupConnection,
-      scheduleReconnect,
-    ]
+    [recomputeInterimTranscript, finalizeSegment, cleanupConnection, scheduleReconnect]
   );
 
   const connect = useCallback(async () => {
@@ -476,7 +415,7 @@ export function useRealtimeTranscription(
         const message =
           typeof tokenPayload?.error === "string"
             ? tokenPayload.error
-            : "获取翻译授权失败，请稍后重试。";
+            : "获取转写授权失败，请稍后重试。";
         throw new Error(message);
       }
       tokenValue = tokenPayload.value;
@@ -484,7 +423,7 @@ export function useRealtimeTranscription(
       if (isStale() || signal.aborted) return;
       if (!shouldReconnectRef.current) return;
       const message =
-        err instanceof Error ? err.message : "获取翻译授权失败，请稍后重试。";
+        err instanceof Error ? err.message : "获取转写授权失败，请稍后重试。";
       setError(message);
       scheduleReconnect();
       return;
@@ -527,7 +466,8 @@ export function useRealtimeTranscription(
     try {
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
-      pc.addTrack(stream.getTracks()[0]);
+      // 转写会话没有下行音频，用 sendonly 单向 transceiver 语义更明确（同时仍挂上本地音轨）。
+      pc.addTransceiver(stream.getTracks()[0], { direction: "sendonly" });
 
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
@@ -552,8 +492,10 @@ export function useRealtimeTranscription(
           reconnectAttemptsRef.current = 0;
           setError(null);
           setIsListening(true);
-          // 新会话建立：丢弃上一次连接可能残留的未定稿轮次状态。
+          // 新会话建立：丢弃上一次连接可能残留的未定稿轮次状态，重新初始化静音检测。
           resetTurnState();
+          teardownSilenceDetection();
+          setupSilenceDetection(stream);
         },
         { signal }
       );
@@ -609,7 +551,7 @@ export function useRealtimeTranscription(
       if (isStale()) return;
 
       if (!sdpResponse.ok) {
-        throw new Error("与 OpenAI Realtime 翻译服务建立连接失败。");
+        throw new Error("与 OpenAI Realtime 转写服务建立连接失败。");
       }
 
       const answerSdp = await sdpResponse.text();
@@ -620,11 +562,17 @@ export function useRealtimeTranscription(
     } catch (err) {
       if (isStale() || signal.aborted) return;
       const message =
-        err instanceof Error ? err.message : "建立翻译连接失败，请稍后重试。";
+        err instanceof Error ? err.message : "建立转写连接失败，请稍后重试。";
       setError(message);
       scheduleReconnect();
     }
-  }, [handleServerEvent, resetTurnState, scheduleReconnect]);
+  }, [
+    handleServerEvent,
+    resetTurnState,
+    scheduleReconnect,
+    setupSilenceDetection,
+    teardownSilenceDetection,
+  ]);
 
   useEffect(() => {
     connectRef.current = () => {
@@ -665,13 +613,22 @@ export function useRealtimeTranscription(
     setIsListening(false);
   }, [cleanupConnection, resetTurnState]);
 
+  // StrictMode 下开发环境会“挂载 -> 卸载 -> 再挂载”，disposedRef 只应反映“当前这次挂载
+  // 是否已卸载”：每次挂载都需在此复位为 false，否则第二次挂载后仍残留上一次卸载置的
+  // true，导致 finalizeSegment 永远早退、整条链路在开发态静默失效。
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+    };
+  }, []);
+
   useEffect(() => {
     return () => {
-      disposedRef.current = true; // F2：卸载后 finalizeSegment 绝不再触发 onFinalSegment
       shouldReconnectRef.current = false;
       generationRef.current += 1;
       cleanupConnection(true);
-      resetTurnState(); // F2：清掉配对定时器，防止卸载后 3s 超时仍触发定稿逻辑
+      resetTurnState();
     };
   }, [cleanupConnection, resetTurnState]);
 
@@ -679,7 +636,6 @@ export function useRealtimeTranscription(
     isSupported,
     isListening,
     interimTranscript,
-    interimTranslation,
     error,
     start,
     stop,

@@ -64,8 +64,8 @@ export default function Home() {
   }, [isPromptDialogOpen]);
 
   return (
-    <div className="min-h-screen bg-slate-950 px-6 py-12 text-slate-100">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-8">
+    <div className="h-dvh overflow-hidden bg-slate-950 px-6 py-6 text-slate-100">
+      <div className="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col gap-6">
         <header className="space-y-2">
           <h1 className="text-3xl font-semibold tracking-tight">
             实时语音翻译 & AI 助手
@@ -134,12 +134,12 @@ export default function Home() {
           </div>
         ) : null}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <section className="space-y-4">
+        <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-2 gap-6 lg:grid-cols-2 lg:grid-rows-1">
+          <section className="flex min-h-0 flex-col gap-4">
             <h2 className="text-lg font-semibold text-slate-200">实时转写 & 翻译</h2>
             <div
               ref={translationListRef}
-              className="space-y-4 max-h-[600px] overflow-y-auto pr-2 no-scrollbar"
+              className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-2 no-scrollbar"
             >
               {segments.length === 0 && !interimTranscript ? (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-500">
@@ -160,11 +160,11 @@ export default function Home() {
             </div>
           </section>
 
-          <section className="space-y-4">
+          <section className="flex min-h-0 flex-col gap-4">
             <h2 className="text-lg font-semibold text-slate-200">AI 问答</h2>
             <div
               ref={qaListRef}
-              className="space-y-4 max-h-[600px] overflow-y-auto pr-2 no-scrollbar"
+              className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-2 no-scrollbar"
             >
               {segments.length === 0 && !interimTranscript ? (
                 <div className="rounded-lg border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-500">
